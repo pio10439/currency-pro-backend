@@ -12,7 +12,9 @@ app.use(express.json());
 const cache = new NodeCache({ stdTTL: 3600 });
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+});
 const db = admin.firestore();
 const messaging = admin.messaging();
 
@@ -29,8 +31,12 @@ const verifyToken = async (req, res, next) => {
 };
 
 app.get("/rates", async (req, res) => {
+  const today = new Date().toISOString().split("T")[0];
   const key = "latest";
-  if (cache.has(key)) return res.json(cache.get(key));
+
+  if (cache.has(key)) {
+    return res.json(cache.get(key));
+  }
 
   try {
     const { data } = await axios.get(
@@ -42,7 +48,15 @@ app.get("/rates", async (req, res) => {
     );
     rates.PLN = 1;
     const result = { rates, date: data[0].effectiveDate };
+
     cache.set(key, result);
+
+    await db.collection("rates").doc(today).set({
+      rates,
+      date: data[0].effectiveDate,
+      timestamp: new Date().toISOString(),
+    });
+
     res.json(result);
   } catch (e) {
     res.status(500).json({ error: "Błąd API NBP" });
@@ -52,7 +66,10 @@ app.get("/rates", async (req, res) => {
 app.get("/rates/:date", async (req, res) => {
   const { date } = req.params;
   const key = date;
-  if (cache.has(key)) return res.json(cache.get(key));
+
+  if (cache.has(key)) {
+    return res.json(cache.get(key));
+  }
 
   try {
     const { data } = await axios.get(
@@ -67,8 +84,45 @@ app.get("/rates/:date", async (req, res) => {
     cache.set(key, result);
     res.json(result);
   } catch (e) {
-    res.status(500).json({ error: "Błąd API NBP (archiwum)" });
+    res.status(500).json({ error: "Brak danych dla tej daty" });
   }
+});
+
+app.get("/rates/archive", async (req, res) => {
+  try {
+    const snapshot = await db
+      .collection("rates")
+      .orderBy("timestamp", "desc")
+      .limit(30)
+      .get();
+
+    const archive = {};
+    snapshot.forEach((doc) => {
+      const data = doc.data();
+      archive[doc.id] = { rates: data.rates, date: data.date };
+    });
+
+    res.json(archive);
+  } catch (e) {
+    res.status(500).json({ error: "Błąd archiwum" });
+  }
+});
+
+app.get("/user", verifyToken, async (req, res) => {
+  const userRef = db.collection("users").doc(req.uid);
+  const snap = await userRef.get();
+
+  if (!snap.exists) {
+    const initialData = {
+      balance: { PLN: 10000, USD: 0, EUR: 0, GBP: 0, CHF: 0 },
+      transactions: [],
+      createdAt: new Date().toISOString(),
+    };
+    await userRef.set(initialData);
+    return res.json(initialData);
+  }
+
+  res.json(snap.data());
 });
 
 app.post("/save-token", verifyToken, async (req, res) => {
@@ -84,45 +138,46 @@ app.post("/transaction", verifyToken, async (req, res) => {
   const { type, currency, amount } = req.body;
   const uid = req.uid;
 
+  if (
+    !["buy", "sell"].includes(type) ||
+    !["USD", "EUR", "GBP", "CHF"].includes(currency) ||
+    amount <= 0
+  ) {
+    return res.status(400).json({ error: "Nieprawidłowe dane" });
+  }
+
   try {
     const { data } = await axios.get(
       "https://api.nbp.pl/api/exchangerates/tables/A/?format=json"
     );
     const rate = data[0].rates.find((r) => r.code === currency)?.mid;
     if (!rate) throw "Brak kursu";
+
     const pln = type === "buy" ? amount * rate : amount / rate;
 
     await db.runTransaction(async (t) => {
       const userRef = db.collection("users").doc(uid);
       const snap = await t.get(userRef);
-      const data = snap.data() || {
-        balance: { PLN: 10000, USD: 0, EUR: 0, GBP: 0, CHF: 0 },
-      };
+      const data = snap.data() || { balance: { PLN: 10000 }, transactions: [] };
 
       if (type === "buy" && data.balance.PLN < pln) throw "Za mało PLN";
-      if (type === "sell" && data.balance[currency] < amount)
-        throw "Za mało waluty";
+      if (type === "sell" && (data.balance[currency] || 0) < amount)
+        throw `Za mało ${currency}`;
 
-      t.set(
-        userRef,
-        {
-          balance: {
-            PLN: (data.balance.PLN || 0) + (type === "buy" ? -pln : pln),
-            [currency]:
-              (data.balance[currency] || 0) +
-              (type === "buy" ? amount : -amount),
-          },
-          transactions: admin.firestore.FieldValue.arrayUnion({
-            type,
-            currency,
-            amount,
-            rate,
-            pln: Math.abs(pln),
-            timestamp: new Date(),
-          }),
-        },
-        { merge: true }
-      );
+      t.update(userRef, {
+        [`balance.PLN`]:
+          (data.balance.PLN || 0) + (type === "buy" ? -pln : pln),
+        [`balance.${currency}`]:
+          (data.balance[currency] || 0) + (type === "buy" ? amount : -amount),
+        transactions: admin.firestore.FieldValue.arrayUnion({
+          type,
+          currency,
+          amount,
+          rate,
+          pln: Number(pln.toFixed(2)),
+          timestamp: new Date().toISOString(),
+        }),
+      });
     });
 
     const userSnap = await db.collection("users").doc(uid).get();
@@ -131,8 +186,10 @@ app.post("/transaction", verifyToken, async (req, res) => {
       await messaging.send({
         token,
         notification: {
-          title: "Transakcja!",
-          body: `${amount} ${currency} za ${pln.toFixed(2)} PLN`,
+          title: "Transakcja wykonana!",
+          body: `${
+            type === "buy" ? "Kupiono" : "Sprzedano"
+          } ${amount} ${currency} za ${pln.toFixed(2)} PLN`,
         },
       });
     }
@@ -143,7 +200,48 @@ app.post("/transaction", verifyToken, async (req, res) => {
   }
 });
 
+app.post("/deposit", verifyToken, async (req, res) => {
+  const { amount } = req.body;
+  if (!amount || amount < 1000) {
+    return res.status(400).json({ error: "Minimalna wpłata: 1000 PLN" });
+  }
+
+  try {
+    const userRef = db.collection("users").doc(req.uid);
+
+    await userRef.update({
+      "balance.PLN": admin.firestore.FieldValue.increment(amount),
+      transactions: admin.firestore.FieldValue.arrayUnion({
+        type: "deposit",
+        amount: amount,
+        currency: "PLN",
+        timestamp: new Date().toISOString(),
+        description: "Zasilenie konta",
+      }),
+    });
+
+    const userSnap = await userRef.get();
+    const token = userSnap.data()?.pushToken;
+    if (token) {
+      await messaging.send({
+        token,
+        notification: {
+          title: "Konto zasilone!",
+          body: `+${amount} PLN na Twoim koncie`,
+        },
+      });
+    }
+
+    res.json({ success: true, message: `Zasilono konto o ${amount} PLN` });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () =>
-  console.log(`Backend działa na http://localhost:${PORT}`)
-);
+app.listen(PORT, () => {
+  console.log(`Backend działa na http://localhost:${PORT}`);
+  console.log(
+    `Wszystkie endpointy: /rates, /user, /transaction, /deposit, /rates/archive`
+  );
+});
