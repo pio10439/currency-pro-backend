@@ -65,6 +65,37 @@ app.get("/rates", async (req, res) => {
     res.status(500).json({ error: "Błąd API NBP" });
   }
 });
+
+app.get("/rates/archive", async (req, res) => {
+  try {
+    const snapshot = await db
+      .collection("rates")
+      .orderBy("timestamp", "desc")
+      .limit(30)
+      .get();
+
+    if (snapshot.empty) {
+      return res
+        .status(404)
+        .json({ error: "Brak danych w archiwum – poczekaj na zapis" });
+    }
+
+    const archive = {};
+    snapshot.forEach((doc) => {
+      const data = doc.data();
+      archive[doc.id] = {
+        rates: data.rates,
+        date: data.date || doc.id,
+      };
+    });
+
+    res.json(archive);
+  } catch (e) {
+    console.error("Błąd archiwum:", e);
+    res.status(500).json({ error: "Błąd odczytu archiwum" });
+  }
+});
+
 S: app.get("/rates/:date", async (req, res) => {
   const { date } = req.params;
   const key = date;
@@ -97,36 +128,6 @@ S: app.get("/rates/:date", async (req, res) => {
     res.json(result);
   } catch (e) {
     res.status(404).json({ error: "Brak danych dla tej daty" });
-  }
-});
-
-app.get("/rates/archive", async (req, res) => {
-  try {
-    const snapshot = await db
-      .collection("rates")
-      .orderBy("timestamp", "desc")
-      .limit(30)
-      .get();
-
-    if (snapshot.empty) {
-      return res
-        .status(404)
-        .json({ error: "Brak danych w archiwum – poczekaj na zapis" });
-    }
-
-    const archive = {};
-    snapshot.forEach((doc) => {
-      const data = doc.data();
-      archive[doc.id] = {
-        rates: data.rates,
-        date: data.date || doc.id,
-      };
-    });
-
-    res.json(archive);
-  } catch (e) {
-    console.error("Błąd archiwum:", e);
-    res.status(500).json({ error: "Błąd odczytu archiwum" });
   }
 });
 
