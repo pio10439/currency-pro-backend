@@ -176,10 +176,7 @@ app.post("/transaction", verifyToken, async (req, res) => {
     if (!rateObj) throw new Error("Brak kursu dla " + currency);
     const currentRate = rateObj.mid;
 
-    const plnAmount =
-      type === "buy"
-        ? Number((amount * currentRate).toFixed(2))
-        : Number((amount / currentRate).toFixed(2));
+    const plnAmount = Number((amount * currentRate).toFixed(2));
 
     await db.runTransaction(async (t) => {
       const userRef = db.collection("users").doc(uid);
