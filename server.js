@@ -172,31 +172,44 @@ app.post("/transaction", verifyToken, async (req, res) => {
     const { data } = await axios.get(
       "https://api.nbp.pl/api/exchangerates/tables/A/?format=json"
     );
-    const rate = data[0].rates.find((r) => r.code === currency)?.mid;
-    if (!rate) throw "Brak kursu";
+    const rateObj = data[0].rates.find((r) => r.code === currency);
+    if (!rateObj) throw new Error("Brak kursu dla " + currency);
+    const currentRate = rateObj.mid;
 
-    const pln = type === "buy" ? amount * rate : amount / rate;
+    const plnAmount =
+      type === "buy"
+        ? Number((amount * currentRate).toFixed(2))
+        : Number((amount / currentRate).toFixed(2));
 
     await db.runTransaction(async (t) => {
       const userRef = db.collection("users").doc(uid);
       const snap = await t.get(userRef);
-      const data = snap.data() || { balance: { PLN: 10000 }, transactions: [] };
+      const userData = snap.data() || {
+        balance: { PLN: 10000, USD: 0, EUR: 0, GBP: 0, CHF: 0 },
+        transactions: [],
+      };
 
-      if (type === "buy" && data.balance.PLN < pln) throw "Za mało PLN";
-      if (type === "sell" && (data.balance[currency] || 0) < amount)
-        throw `Za mało ${currency}`;
+      if (type === "buy" && (userData.balance.PLN || 0) < plnAmount) {
+        throw new Error("Za mało PLN na koncie");
+      }
+      if (type === "sell" && (userData.balance[currency] || 0) < amount) {
+        throw new Error(`Za mało ${currency} na koncie`);
+      }
+
+      const newPLN =
+        (userData.balance.PLN || 0) + (type === "buy" ? -plnAmount : plnAmount);
+      const newCurrency =
+        (userData.balance[currency] || 0) + (type === "buy" ? amount : -amount);
 
       t.update(userRef, {
-        [`balance.PLN`]:
-          (data.balance.PLN || 0) + (type === "buy" ? -pln : pln),
-        [`balance.${currency}`]:
-          (data.balance[currency] || 0) + (type === "buy" ? amount : -amount),
+        "balance.PLN": newPLN,
+        [`balance.${currency}`]: newCurrency,
         transactions: admin.firestore.FieldValue.arrayUnion({
           type,
           currency,
-          amount,
-          rate,
-          pln: Number(pln.toFixed(2)),
+          amount: Number(amount.toFixed(4)),
+          rate: Number(currentRate.toFixed(4)),
+          pln: plnAmount,
           timestamp: new Date().toISOString(),
         }),
       });
@@ -208,17 +221,18 @@ app.post("/transaction", verifyToken, async (req, res) => {
       await messaging.send({
         token,
         notification: {
-          title: "Transakcja wykonana!",
-          body: `${
-            type === "buy" ? "Kupiono" : "Sprzedano"
-          } ${amount} ${currency} za ${pln.toFixed(2)} PLN`,
+          title: type === "buy" ? "Kupiono!" : "Sprzedano!",
+          body: `${amount} ${currency} za ${plnAmount.toFixed(
+            2
+          )} PLN (kurs: ${currentRate.toFixed(4)})`,
         },
       });
     }
 
-    res.json({ success: true });
+    res.json({ success: true, plnAmount, rate: currentRate });
   } catch (e) {
-    res.status(400).json({ error: e.message || e });
+    console.error("Błąd transakcji:", e);
+    res.status(400).json({ error: e.message || "Błąd transakcji" });
   }
 });
 
