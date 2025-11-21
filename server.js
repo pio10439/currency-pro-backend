@@ -3,6 +3,7 @@ const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
 const admin = require("firebase-admin");
+const fetch = require("node-fetch"); // <-- DODANE DLA EXPO PUSH
 const NodeCache = require("node-cache");
 
 const app = express();
@@ -11,32 +12,76 @@ app.use(express.json());
 
 const cache = new NodeCache({ stdTTL: 3600 });
 
+// Firebase Admin – tylko do Firestore i Auth
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 const db = admin.firestore();
-const messaging = admin.messaging();
 
+// FUNKCJA EXPO PUSH – DZIAŁA WSZĘDZIE, BEZ BŁĘDÓW
+async function sendExpoPush(token, title, body) {
+  try {
+    const response = await fetch("https://exp.host/--/api/v2/push/send", {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Accept-encoding": "gzip, deflate",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        to: token,
+        sound: "default",
+        title,
+        body,
+        priority: "high",
+        // Dodatkowe bajery
+        channelId: "default", // dla Androida
+      }),
+    });
+
+    const result = await response.json();
+
+    // SUGESTIA 3: Logujemy błędy Expo
+    if (
+      !response.ok ||
+      result.errors ||
+      (result.data && result.data.status === "error")
+    ) {
+      console.warn("Expo Push Error:", result);
+      // Opcjonalnie: usuń zły token
+      // await db.collection("users").doc(uid).update({ pushToken: admin.firestore.FieldValue.delete() });
+    } else {
+      console.log("Expo Push wysłany!");
+    }
+  } catch (e) {
+    console.warn("Błąd połączenia z Expo:", e.message);
+  }
+}
+
+// Middleware weryfikacji tokena
 const verifyToken = async (req, res, next) => {
-  const token = req.headers.authorization?.split(" ")[1];
-  if (!token) return res.status(401).json({ error: "Brak tokena" });
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "Brak tokena" });
+  }
+  const token = authHeader.split("Bearer ")[1];
   try {
     const decoded = await admin.auth().verifyIdToken(token);
     req.uid = decoded.uid;
     next();
   } catch (e) {
-    res.status(401).json({ error: "Zły token" });
+    res.status(401).json({ error: "Nieprawidłowy token" });
   }
 };
+
+// === ENDPOINTY ===
 
 app.get("/rates", async (req, res) => {
   const today = new Date().toISOString().split("T")[0];
   const key = "latest";
 
-  if (cache.has(key)) {
-    return res.json(cache.get(key));
-  }
+  if (cache.has(key)) return res.json(cache.get(key));
 
   try {
     const { data } = await axios.get(
@@ -55,7 +100,7 @@ app.get("/rates", async (req, res) => {
       {
         rates,
         date: data[0].effectiveDate,
-        timestamp: new Date().toISOString(),
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
       },
       { merge: true }
     );
@@ -75,9 +120,7 @@ app.get("/rates/archive", async (req, res) => {
       .get();
 
     if (snapshot.empty) {
-      return res
-        .status(404)
-        .json({ error: "Brak danych w archiwum – poczekaj na zapis" });
+      return res.json({ message: "Archiwum puste – poczekaj na zapis kursów" });
     }
 
     const archive = {};
@@ -96,13 +139,11 @@ app.get("/rates/archive", async (req, res) => {
   }
 });
 
-S: app.get("/rates/:date", async (req, res) => {
+app.get("/rates/:date", async (req, res) => {
   const { date } = req.params;
   const key = date;
 
-  if (cache.has(key)) {
-    return res.json(cache.get(key));
-  }
+  if (cache.has(key)) return res.json(cache.get(key));
 
   try {
     const { data } = await axios.get(
@@ -114,13 +155,14 @@ S: app.get("/rates/:date", async (req, res) => {
     );
     rates.PLN = 1;
     const result = { rates, date: data[0].effectiveDate };
+
     cache.set(key, result);
 
     await db.collection("rates").doc(date).set(
       {
         rates,
         date: data[0].effectiveDate,
-        timestamp: new Date().toISOString(),
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
       },
       { merge: true }
     );
@@ -150,6 +192,9 @@ app.get("/user", verifyToken, async (req, res) => {
 
 app.post("/save-token", verifyToken, async (req, res) => {
   const { token } = req.body;
+  if (!token || typeof token !== "string") {
+    return res.status(400).json({ error: "Nieprawidłowy token" });
+  }
   await db
     .collection("users")
     .doc(req.uid)
@@ -175,15 +220,17 @@ app.post("/transaction", verifyToken, async (req, res) => {
     );
     const rateObj = data[0].rates.find((r) => r.code === currency);
     if (!rateObj) throw new Error("Brak kursu dla " + currency);
-    const currentRate = rateObj.mid;
 
-    const plnAmount = Number((amount * currentRate).toFixed(2));
+    const currentRate = rateObj.mid;
+    const plnAmount = Number(
+      (type === "buy" ? amount * currentRate : amount / currentRate).toFixed(2)
+    );
 
     await db.runTransaction(async (t) => {
       const userRef = db.collection("users").doc(uid);
       const snap = await t.get(userRef);
       const userData = snap.data() || {
-        balance: { PLN: 10000, USD: 0, EUR: 0, GBP: 0, CHF: 0 },
+        balance: { PLN: 10000 },
         transactions: [],
       };
 
@@ -194,14 +241,13 @@ app.post("/transaction", verifyToken, async (req, res) => {
         throw new Error(`Za mało ${currency} na koncie`);
       }
 
-      const newPLN =
-        (userData.balance.PLN || 0) + (type === "buy" ? -plnAmount : plnAmount);
-      const newCurrency =
-        (userData.balance[currency] || 0) + (type === "buy" ? amount : -amount);
-
       t.update(userRef, {
-        "balance.PLN": newPLN,
-        [`balance.${currency}`]: newCurrency,
+        "balance.PLN":
+          (userData.balance.PLN || 0) +
+          (type === "buy" ? -plnAmount : plnAmount),
+        [`balance.${currency}`]:
+          (userData.balance[currency] || 0) +
+          (type === "buy" ? amount : -amount),
         transactions: admin.firestore.FieldValue.arrayUnion({
           type,
           currency,
@@ -213,21 +259,20 @@ app.post("/transaction", verifyToken, async (req, res) => {
       });
     });
 
+    // EXPO PUSH – DZIAŁA NA EXPO GO I WSZĘDZIE!
     const userSnap = await db.collection("users").doc(uid).get();
     const token = userSnap.data()?.pushToken;
     if (token) {
-      await messaging.send({
+      await sendExpoPush(
         token,
-        notification: {
-          title: type === "buy" ? "Kupiono!" : "Sprzedano!",
-          body: `${amount} ${currency} za ${plnAmount.toFixed(
-            2
-          )} PLN (kurs: ${currentRate.toFixed(4)})`,
-        },
-      });
+        type === "buy" ? "Kupiono!" : "Sprzedano!",
+        `${amount} ${currency} za ${plnAmount.toFixed(
+          2
+        )} PLN (kurs: ${currentRate.toFixed(4)})`
+      );
     }
 
-    res.json({ success: true, plnAmount, rate: currentRate });
+    res.json({ success: true });
   } catch (e) {
     console.error("Błąd transakcji:", e);
     res.status(400).json({ error: e.message || "Błąd transakcji" });
@@ -247,23 +292,22 @@ app.post("/deposit", verifyToken, async (req, res) => {
       "balance.PLN": admin.firestore.FieldValue.increment(amount),
       transactions: admin.firestore.FieldValue.arrayUnion({
         type: "deposit",
-        amount: amount,
+        amount,
         currency: "PLN",
         timestamp: new Date().toISOString(),
         description: "Zasilenie konta",
       }),
     });
 
+    // EXPO PUSH
     const userSnap = await userRef.get();
     const token = userSnap.data()?.pushToken;
     if (token) {
-      await messaging.send({
+      await sendExpoPush(
         token,
-        notification: {
-          title: "Konto zasilone!",
-          body: `+${amount} PLN na Twoim koncie`,
-        },
-      });
+        "Konto zasilone!",
+        `+${amount} PLN na Twoim koncie`
+      );
     }
 
     res.json({ success: true, message: `Zasilono konto o ${amount} PLN` });
@@ -274,8 +318,6 @@ app.post("/deposit", verifyToken, async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Backend działa na http://localhost:${PORT}`);
-  console.log(
-    `Wszystkie endpointy: /rates, /user, /transaction, /deposit, /rates/archive`
-  );
+  console.log(`Backend działa na porcie ${PORT}`);
+  console.log("Expo Push Notifications włączone – działa nawet w Expo Go!");
 });
